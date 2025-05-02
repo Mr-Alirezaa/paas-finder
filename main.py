@@ -4,22 +4,36 @@ import numpy as np
 from ortools.sat.python import cp_model
 
 # Configuration section - Customize these values as needed
+# Day ranges for scheduling
+MANUAL_DAYS_START = 1
+MANUAL_DAYS_END = 7
+AUTO_DAYS_START = 8
+AUTO_DAYS_END = 19
+
+# Shift configuration
+AUTO_SHIFT_TYPES = ["A", "B", "D"]  # Types of shifts for automatic assignment
+PEOPLE_PER_SHIFT = 3  # Number of people assigned to each shift
+
+# Constraint configurations
+MAX_SHIFTS_PER_PERSON = 3  # Maximum total shifts per person (manual + auto periods)
+ENFORCE_MAX_SHIFTS = True  # Whether to enforce the max shifts constraint
+
 SHIFT_SCORES = {
     # Regular days (Sat through Wed)
     "regular": {
         "A": 3.0,
         "B": 3.0,
-        "C": 3.0,
+        "C": 3.0,  # Only used for days 1-7 initial scoring
         "D": 8.0,
-        "E": 4.0
+        "E": 4.0   # Only used for days 1-7 initial scoring
     },
     # High-value days (Thu and Fri)
     "high_value": {
         "A": 12.0,
         "B": 12.0,
-        "C": 12.0,
+        "C": 12.0,  # Only used for days 1-7 initial scoring
         "D": 12.0,
-        "E": 12.0
+        "E": 12.0   # Only used for days 1-7 initial scoring
     }
 }
 
@@ -56,7 +70,7 @@ for i, row in df.iterrows():
     }
 
     # Process initial shifts (days 1-7)
-    for day in range(1, 8):
+    for day in range(MANUAL_DAYS_START, MANUAL_DAYS_END + 1):
         col_name = f'Day {day}'
         shift = str(row[col_name]).strip() if pd.notna(row[col_name]) else ''
 
@@ -76,15 +90,16 @@ model = cp_model.CpModel()
 x = {}
 for person_id, person in eligible_people.items():
     x[person_id] = {}
-    for day in range(8, 20):  # Days 8-19
+    for day in range(AUTO_DAYS_START, AUTO_DAYS_END + 1):  # Days 8-19
         x[person_id][day] = {}
-        for shift_type in ["A", "B", "D"]:  # Only A, B, D shifts for days 8-19
+        for shift_type in AUTO_SHIFT_TYPES:  # Only A, B, D shifts for days 8-19
             x[person_id][day][shift_type] = model.NewBoolVar(f'x_{person_id}_{day}_{shift_type}')
 
 # Track total scores
 total_score = {}
 shift_count_D = {}  # Track D shifts per person
 shift_count_thu_fri = {}  # Track Thu/Fri shifts per person
+initial_shift_count = {}  # Track total initial shifts per person
 
 for person_id, person in eligible_people.items():
     # Initialize from initial scores (days 1-7)
@@ -97,10 +112,13 @@ for person_id, person in eligible_people.items():
     shift_count_thu_fri[person_id] = sum(1 for day, shift in person['current_assignments']
                                         if DAY_NAMES[(day - 1) % 7] in ["Thursday", "Friday"])
 
+    # Track total shifts from initial assignments
+    initial_shift_count[person_id] = len(person['current_assignments'])
+
     # Add score contributions from new assignments (days 8-19)
-    for day in range(8, 20):
+    for day in range(AUTO_DAYS_START, AUTO_DAYS_END + 1):
         day_name = DAY_TYPES[day]
-        for shift_type in ["A", "B", "D"]:
+        for shift_type in AUTO_SHIFT_TYPES:
             score = get_shift_score(shift_type, day_name)
             score_expr.append(x[person_id][day][shift_type] * int(score * 100))  # Scale to avoid floating point
 
@@ -109,22 +127,22 @@ for person_id, person in eligible_people.items():
     model.Add(total_score[person_id] == sum(score_expr))
 
 # Constraints
-for day in range(8, 20):
+for day in range(AUTO_DAYS_START, AUTO_DAYS_END + 1):
     day_name = DAY_TYPES[day]
 
-    # Constraint: Exactly 3 people per shift type per day
-    for shift_type in ["A", "B", "D"]:
-        model.Add(sum(x[person_id][day][shift_type] for person_id in eligible_people) == 3)
+    # Constraint: Exactly PEOPLE_PER_SHIFT people per shift type per day
+    for shift_type in AUTO_SHIFT_TYPES:
+        model.Add(sum(x[person_id][day][shift_type] for person_id in eligible_people) == PEOPLE_PER_SHIFT)
 
     # Constraint: Each person works at most one shift per day
     for person_id in eligible_people:
-        model.Add(sum(x[person_id][day][shift_type] for shift_type in ["A", "B", "D"]) <= 1)
+        model.Add(sum(x[person_id][day][shift_type] for shift_type in AUTO_SHIFT_TYPES) <= 1)
 
     # Constraint: Married and non-native people can't work Wednesday to Friday
     if day_name in ["Wednesday", "Thursday", "Friday"]:
         for person_id, person in eligible_people.items():
             if person['married'] or person['non_native']:
-                for shift_type in ["A", "B", "D"]:
+                for shift_type in AUTO_SHIFT_TYPES:
                     model.Add(x[person_id][day][shift_type] == 0)
 
     # Constraint: A shifts only for people with IDs 49-90
@@ -139,11 +157,24 @@ for day in range(8, 20):
 
 # Constraint: No consecutive days
 for person_id in eligible_people:
-    for day in range(8, 19):  # Up to day 18 (since we compare with next day)
+    # Check if the person worked on day 7 (to bridge from manual to auto-assigned period)
+    worked_day_7 = False
+    for day, shift in eligible_people[person_id]['current_assignments']:
+        if day == MANUAL_DAYS_END:
+            worked_day_7 = True
+            break
+
+    # If person worked on the last manual day, they can't work on the first auto day
+    if worked_day_7:
+        for shift_type in AUTO_SHIFT_TYPES:
+            model.Add(x[person_id][AUTO_DAYS_START][shift_type] == 0)
+
+    # Continue with the regular consecutive days constraint for auto days
+    for day in range(AUTO_DAYS_START, AUTO_DAYS_END):  # Up to second-last day (since we compare with next day)
         # Create a Boolean variable that's true if person works on this day
         works_today = model.NewBoolVar(f'works_today_{person_id}_{day}')
-        today_shifts = [x[person_id][day][s] for s in ["A", "B", "D"]]
-        tomorrow_shifts = [x[person_id][day+1][s] for s in ["A", "B", "D"]]
+        today_shifts = [x[person_id][day][s] for s in AUTO_SHIFT_TYPES]
+        tomorrow_shifts = [x[person_id][day+1][s] for s in AUTO_SHIFT_TYPES]
 
         # Link works_today with the sum of today's shifts
         model.Add(sum(today_shifts) >= 1).OnlyEnforceIf(works_today)
@@ -156,32 +187,47 @@ for person_id in eligible_people:
 for person_id, count in shift_count_D.items():
     if count >= 1:
         # Already has a D shift from days 1-7, so can't have any more
-        for day in range(8, 20):
+        for day in range(AUTO_DAYS_START, AUTO_DAYS_END + 1):
             model.Add(x[person_id][day]["D"] == 0)
     else:
         # Can have at most one D shift in days 8-19
-        model.Add(sum(x[person_id][day]["D"] for day in range(8, 20)) <= 1)
+        model.Add(sum(x[person_id][day]["D"] for day in range(AUTO_DAYS_START, AUTO_DAYS_END + 1)) <= 1)
 
 # Constraint: No more than one Thursday or Friday shift in the period
 for person_id, count in shift_count_thu_fri.items():
     if count >= 1:
         # Already has a Thu/Fri shift from days 1-7, so can't have any more high-score days
-        for day in range(8, 20):
+        for day in range(AUTO_DAYS_START, AUTO_DAYS_END + 1):
             if DAY_TYPES[day] in ["Thursday", "Friday"]:
-                for shift_type in ["A", "B", "D"]:
+                for shift_type in AUTO_SHIFT_TYPES:
                     model.Add(x[person_id][day][shift_type] == 0)
     else:
         # Can have at most one Thu/Fri shift in days 8-19
-        thu_fri_days = [day for day in range(8, 20) if DAY_TYPES[day] in ["Thursday", "Friday"]]
-        model.Add(sum(x[person_id][day][s] for day in thu_fri_days for s in ["A", "B", "D"]) <= 1)
+        thu_fri_days = [day for day in range(AUTO_DAYS_START, AUTO_DAYS_END + 1) if DAY_TYPES[day] in ["Thursday", "Friday"]]
+        model.Add(sum(x[person_id][day][s] for day in thu_fri_days for s in AUTO_SHIFT_TYPES) <= 1)
+
+# Constraint: Maximum shifts per person across the entire period
+if ENFORCE_MAX_SHIFTS:
+    for person_id, initial_count in initial_shift_count.items():
+        remaining_shifts = MAX_SHIFTS_PER_PERSON - initial_count
+        if remaining_shifts <= 0:
+            # Person has already reached or exceeded their maximum shifts, don't assign any more
+            for day in range(AUTO_DAYS_START, AUTO_DAYS_END + 1):
+                for shift_type in AUTO_SHIFT_TYPES:
+                    model.Add(x[person_id][day][shift_type] == 0)
+        else:
+            # Person can have at most remaining_shifts more shifts
+            model.Add(sum(x[person_id][day][s]
+                          for day in range(AUTO_DAYS_START, AUTO_DAYS_END + 1)
+                          for s in AUTO_SHIFT_TYPES) <= remaining_shifts)
 
 # Objective: Fairness (minimize deviation from average)
 # First, compute the expected average score
 total_initial_score = sum(person['initial_score'] for person in people.values())
-total_shifts = 3 * 3 * 12  # 3 types × 3 persons × 12 days
+total_shifts = PEOPLE_PER_SHIFT * len(AUTO_SHIFT_TYPES) * (AUTO_DAYS_END - AUTO_DAYS_START + 1)  # people × types × days
 avg_score_estimate = (total_initial_score +
-                      sum(get_shift_score(s, DAY_TYPES[d]) for d in range(8, 20)
-                          for s in ["A", "B", "D"]) * 3) / 90  # Divide by total people
+                      sum(get_shift_score(s, DAY_TYPES[d]) for d in range(AUTO_DAYS_START, AUTO_DAYS_END + 1)
+                          for s in AUTO_SHIFT_TYPES) * PEOPLE_PER_SHIFT) / 90  # Divide by total people
 avg_score_scaled = int(avg_score_estimate * 100)
 
 # Define deviation variables
@@ -213,7 +259,7 @@ if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
 
     # Create result dataframe with all days (1-19)
     result_df = pd.DataFrame(index=range(1, 91),
-                            columns=[f'Day {i}' for i in range(1, 20)])
+                            columns=[f'Day {i}' for i in range(MANUAL_DAYS_START, AUTO_DAYS_END + 1)])
 
     # Add person attributes for verification
     result_df['food_divider'] = False
@@ -232,15 +278,15 @@ if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
 
     # Fill in the new assignments (days 8-19)
     for person_id in eligible_people:
-        for day in range(8, 20):
-            for shift_type in ["A", "B", "D"]:
+        for day in range(AUTO_DAYS_START, AUTO_DAYS_END + 1):
+            for shift_type in AUTO_SHIFT_TYPES:
                 if solver.Value(x[person_id][day][shift_type]) == 1:
                     result_df.at[person_id, f'Day {day}'] = shift_type
 
     # Double-check no food dividers got shifts
     for person_id, person in people.items():
         if person['food_divider']:
-            for day in range(8, 20):
+            for day in range(AUTO_DAYS_START, AUTO_DAYS_END + 1):
                 if pd.notna(result_df.at[person_id, f'Day {day}']):
                     print(f"ERROR: Food divider {person_id} was assigned a shift on Day {day}")
                     result_df.at[person_id, f'Day {day}'] = np.nan
@@ -250,8 +296,8 @@ if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
     for person_id, person in people.items():
         if person_id in eligible_people:
             score = person['initial_score']
-            for day in range(8, 20):
-                for shift_type in ["A", "B", "D"]:
+            for day in range(AUTO_DAYS_START, AUTO_DAYS_END + 1):
+                for shift_type in AUTO_SHIFT_TYPES:
                     if person_id in x and day in x[person_id] and shift_type in x[person_id][day]:
                         if solver.Value(x[person_id][day][shift_type]) == 1:
                             score += get_shift_score(shift_type, DAY_TYPES[day])
