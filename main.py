@@ -246,10 +246,11 @@ model.Minimize(sum(absolute_deviation.values()))
 solver = cp_model.CpSolver()
 
 # Set parameters to prioritize finding the optimal solution
-solver.parameters.max_time_in_seconds = 0  # 0 means no time limit
+solver.parameters.max_time_in_seconds = 1000  # 0 means no time limit
 solver.parameters.num_search_workers = 8  # Use more threads if available on your system
 solver.parameters.log_search_progress = True  # Log progress to console
-solver.parameters.optimization_level = 3  # Highest optimization level
+solver.parameters.cp_model_presolve = True  # Enable presolve (default)
+solver.parameters.linearization_level = 2  # More aggressive linearization (0-2)
 solver.parameters.enumerate_all_solutions = False  # Focus on best solution
 
 print("Starting optimization. This may take a while...")
