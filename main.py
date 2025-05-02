@@ -1,68 +1,26 @@
-import csv
 import pandas as pd
 import numpy as np
 from ortools.sat.python import cp_model
 
-# Configuration section - Customize these values as needed
-# Day ranges for scheduling
-MANUAL_DAYS_START = 1
-MANUAL_DAYS_END = 7
-AUTO_DAYS_START = 8
-AUTO_DAYS_END = 19
-
-# Shift configuration
-AUTO_SHIFT_TYPES = ["A", "B", "D"]  # Types of shifts for automatic assignment
-PEOPLE_PER_SHIFT = 3  # Number of people assigned to each shift
-
-# Day type configurations
-HIGH_VALUE_DAYS = ["Thursday", "Friday"]  # Days with higher shift scores
-
-# Eligibility configurations
-EXCLUDE_FOOD_DIVIDERS = True  # Whether to exclude food dividers from shifts
-MARRIED_EXCLUSION_DAYS = ["Wednesday", "Thursday", "Friday"]  # Days married people can't work
-NON_NATIVE_EXCLUSION_DAYS = ["Wednesday", "Thursday", "Friday"]  # Days non-native people can't work
-
-# Constraint configurations
-ENFORCE_MAX_SHIFTS = True  # Whether to enforce the max shifts constraint
-MAX_SHIFTS_PER_PERSON = 3  # Maximum total shifts per person (manual + auto periods)
-
-ENFORCE_SHIFT_TYPE_ID_RANGES = True  # Whether to enforce the ID ranges for shift types
-A_SHIFT_MIN_ID = 49  # Minimum person ID for A shifts
-B_SHIFT_MAX_ID = 48  # Maximum person ID for B shifts
-
-ENFORCE_NO_CONSECUTIVE_DAYS = True  # Whether to enforce the no consecutive days constraint
-ENFORCE_MAX_D_SHIFTS = True  # Whether to enforce the max D shifts constraint
-MAX_D_SHIFTS = 1  # Maximum D shifts per person
-
-ENFORCE_MAX_HIGH_VALUE_DAYS = True  # Whether to enforce max Thursday/Friday shifts
-MAX_HIGH_VALUE_DAYS = 1  # Maximum high-value day shifts per person
-
-SHIFT_SCORES = {
-    # Regular days (Sat through Wed)
-    "regular": {
-        "A": 3.0,
-        "B": 3.0,
-        "C": 3.0,  # Only used for days 1-7 initial scoring
-        "D": 8.0,
-        "E": 4.0   # Only used for days 1-7 initial scoring
-    },
-    # High-value days (Thu and Fri)
-    "high_value": {
-        "A": 12.0,
-        "B": 12.0,
-        "C": 12.0,  # Only used for days 1-7 initial scoring
-        "D": 12.0,
-        "E": 12.0   # Only used for days 1-7 initial scoring
-    }
-}
-
-# Define day types and shift scores
-DAY_NAMES = ["Saturday", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
-DAY_TYPES = {
-    8: "Saturday", 9: "Sunday", 10: "Monday", 11: "Tuesday", 12: "Wednesday",
-    13: "Thursday", 14: "Friday", 15: "Saturday", 16: "Sunday", 17: "Monday",
-    18: "Tuesday", 19: "Wednesday"
-}
+# Import configurations
+from config import (
+    # Day ranges
+    MANUAL_DAYS_START, MANUAL_DAYS_END, AUTO_DAYS_START, AUTO_DAYS_END,
+    # Shift configuration
+    AUTO_SHIFT_TYPES, PEOPLE_PER_SHIFT,
+    # Day types
+    HIGH_VALUE_DAYS, DAY_NAMES, DAY_TYPES,
+    # Eligibility
+    EXCLUDE_FOOD_DIVIDERS, MARRIED_EXCLUSION_DAYS, NON_NATIVE_EXCLUSION_DAYS,
+    # Constraint configurations
+    ENFORCE_MAX_SHIFTS, MAX_SHIFTS_PER_PERSON,
+    ENFORCE_SHIFT_TYPE_ID_RANGES, A_SHIFT_MIN_ID, B_SHIFT_MAX_ID,
+    ENFORCE_NO_CONSECUTIVE_DAYS,
+    ENFORCE_MAX_D_SHIFTS, MAX_D_SHIFTS,
+    ENFORCE_MAX_HIGH_VALUE_DAYS, MAX_HIGH_VALUE_DAYS,
+    # Scoring
+    SHIFT_SCORES
+)
 
 def get_shift_score(shift_type, day_name):
     if day_name in HIGH_VALUE_DAYS:
@@ -255,15 +213,18 @@ if ENFORCE_MAX_SHIFTS:
                           for s in AUTO_SHIFT_TYPES) <= remaining_shifts)
 
 # Objective: Fairness (minimize deviation from average)
-# First, compute the expected average score
-total_initial_score = sum(person['initial_score'] for person in people.values())
+# Calculate average using only eligible people (excluding food dividers)
+total_initial_score_eligible = sum(person['initial_score'] for person in eligible_people.values())
+num_eligible_people = len(eligible_people)
+
+# Calculate total score from new shifts
 total_shifts = PEOPLE_PER_SHIFT * len(AUTO_SHIFT_TYPES) * (AUTO_DAYS_END - AUTO_DAYS_START + 1)  # people × types × days
-avg_score_estimate = (total_initial_score +
+avg_score_estimate = (total_initial_score_eligible +
                       sum(get_shift_score(s, DAY_TYPES[d]) for d in range(AUTO_DAYS_START, AUTO_DAYS_END + 1)
-                          for s in AUTO_SHIFT_TYPES) * PEOPLE_PER_SHIFT) / 90  # Divide by total people
+                          for s in AUTO_SHIFT_TYPES) * PEOPLE_PER_SHIFT) / num_eligible_people  # Divide by eligible people
 avg_score_scaled = int(avg_score_estimate * 100)
 
-# Define deviation variables
+# Define deviation variables - only for eligible people
 deviation_up = {}
 deviation_down = {}
 absolute_deviation = {}
@@ -278,18 +239,33 @@ for person_id in eligible_people:
     model.Add(avg_score_scaled - total_score[person_id] <= deviation_down[person_id])
     model.Add(absolute_deviation[person_id] == deviation_up[person_id] + deviation_down[person_id])
 
-# Minimize the sum of absolute deviations (for fairness)
+# Minimize the sum of absolute deviations (for fairness) - only for eligible people
 model.Minimize(sum(absolute_deviation.values()))
 
 # Solve the model
 solver = cp_model.CpSolver()
-solver.parameters.max_time_in_seconds = 600  # 10-minute timeout
+
+# Set parameters to prioritize finding the optimal solution
+solver.parameters.max_time_in_seconds = 0  # 0 means no time limit
+solver.parameters.num_search_workers = 8  # Use more threads if available on your system
+solver.parameters.log_search_progress = True  # Log progress to console
+solver.parameters.optimization_level = 3  # Highest optimization level
+solver.parameters.enumerate_all_solutions = False  # Focus on best solution
+
+print("Starting optimization. This may take a while...")
 status = solver.Solve(model)
 
 # Process results
-if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-    print(f"Solution found with status: {solver.StatusName(status)}")
+if status == cp_model.OPTIMAL:
+    print(f"OPTIMAL solution found! The absolute best score distribution has been achieved.")
+elif status == cp_model.FEASIBLE:
+    print(f"FEASIBLE solution found, but optimality not proven. There might be a better solution.")
+else:
+    print(f"No solution found. Status: {solver.StatusName(status)}")
+    exit(1)
 
+# If we have any solution (OPTIMAL or FEASIBLE), process it
+if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
     # Create result dataframe with all days (1-19)
     result_df = pd.DataFrame(index=range(1, 91),
                             columns=[f'Day {i}' for i in range(MANUAL_DAYS_START, AUTO_DAYS_END + 1)])
@@ -324,7 +300,7 @@ if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
                     print(f"ERROR: Food divider {person_id} was assigned a shift on Day {day}")
                     result_df.at[person_id, f'Day {day}'] = np.nan
 
-    # Calculate final scores
+    # Calculate final scores for all people (including food dividers)
     final_scores = {}
     for person_id, person in people.items():
         if person_id in eligible_people:
@@ -344,8 +320,19 @@ if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
     # Save to CSV
     result_df.to_csv('shifts_final.csv')
     print(f"Results saved to shifts_final.csv")
-    print(f"Average score: {sum(final_scores.values()) / len(final_scores):.2f}")
-    print(f"Min score: {min(final_scores.values()):.2f}")
-    print(f"Max score: {max(final_scores.values()):.2f}")
-else:
-    print(f"No solution found. Status: {solver.StatusName(status)}")
+
+    # Calculate and display statistics separately for eligible and all people
+    eligible_scores = [final_scores[p_id] for p_id in eligible_people]
+    all_scores = list(final_scores.values())
+
+    print(f"Stats for eligible people (excluding food dividers):")
+    print(f"  Average score: {sum(eligible_scores) / len(eligible_scores):.2f}")
+    print(f"  Min score: {min(eligible_scores):.2f}")
+    print(f"  Max score: {max(eligible_scores):.2f}")
+    print(f"  Standard deviation: {np.std(eligible_scores):.2f}")
+
+    print(f"\nStats for all people (including food dividers):")
+    print(f"  Average score: {sum(all_scores) / len(all_scores):.2f}")
+    print(f"  Min score: {min(all_scores):.2f}")
+    print(f"  Max score: {max(all_scores):.2f}")
+    print(f"  Standard deviation: {np.std(all_scores):.2f}")
